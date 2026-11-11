@@ -1,0 +1,124 @@
+# NoiseFit Halo Face Builder — context for AI assistants
+
+> Offline pipeline that turns a photo into a native NoiseFit Halo watch face
+> (container magic `afafaf02`, 466×466 RGB565 big endian, LZO1X per 4096-byte
+> block) and installs it over Bluetooth LE by replaying the vendor's command
+> session, window framing and flow control. No server, no account, no root, no
+> vendor compiler.
+
+This file tells an assistant what is proven, where the code lives, and what is
+still open. Read `Docs/PROTOCOL.md` for byte-level detail before answering
+protocol questions.
+
+## Documentation map
+
+- `README.md` — overview, status, repo map, quick start.
+- `setup.md` — toolchain, build, install, watch prep, troubleshooting.
+- `Docs/PROTOCOL.md` — authoritative container, blob and BLE reference.
+- `Docs/TECHNICAL_REPORT.md` — how each value was established, with evidence.
+- `Docs/APPROACHES_REPORT.md` — what was tried; superseded claims are marked.
+- `profiles/halo.json` — every model-specific value with a status field.
+- `skills/jailbreak-noiseFit/skill.md` — procedure for porting to another model.
+
+## Source map
+
+Android app, Java, no dependencies (`android/app/src/main/`):
+
+- `java/com/jay/wfup/CropView.java` — square crop viewport, drag + pinch.
+- `java/com/jay/wfup/FacePipeline.java` — photo → composed 466×466 screen → blob.
+- `java/com/jay/wfup/FaceBuilder.java` — blob → container (header, checksums, pack).
+- `java/com/jay/wfup/Lzo1x.java` — LZO1X codec.
+- `java/com/jay/wfup/LzoCrc32.java` — vendor S-box checksum.
+- `java/com/jay/wfup/ReplayBuilder.java` — prefix, CRC32 tail, windows, chunks.
+- `java/com/jay/wfup/MainActivity.java` — UI, BLE client, replay engine.
+- `assets/blob.bin` — 754368-byte reference blob (face A).
+- `assets/replay3.txt` — captured replay script used by the REPLAY path.
+
+PC reference tools (`builder/`): `build_face.py`, `verify_build.py`,
+`generate_replay.py`, `lzo1x.py`, `lzo_crc32.py`.
+
+## Verified facts
+
+Container:
+
+- magic `afafaf02`, header **dynamic** `26 + 2 * blockCount` (396 B for 185 blocks).
+- field 4 = uncompressed blob size (754368 for the Halo).
+- field 8 = vendor checksum of the blob, field 16 = vendor checksum of the payload.
+  The checksum is not a polynomial CRC: it is a vendor 256-entry S-box
+  (`table[0] == 0x60454269`), see `LzoCrc32.java`.
+- payload = independent LZO1X blocks of 4096 bytes.
+- transfer tail = `crc32(prefix22 || container)` little endian (zlib CRC32). Solved.
+
+Blob layout (face A, 754368 B), pixels RGB565 **big endian**, stride `width * 2`:
+
+| range | content |
+| --- | --- |
+| `0 .. 514` | config header + widget table |
+| `514 .. 192714` | preview 310×310 — face-list thumbnail only |
+| `192714 .. 320056` | clock-bar background 466×136 + 590-byte tail |
+| `320056 .. 627616` | artwork 466×330 |
+| `627616 .. 754368` | glyph sprite sheets (date, digits, colon, AM-PM) |
+
+Screen is 1:1: rows 0–135 from the mid block, rows 136–465 from the artwork,
+sprite sheets blitted on top. Full-bleed split is therefore at row 136.
+
+Widget table at config offset `0x180`, 13-byte records:
+`u16 x, u16 y, u16 w, u16 h, u8 kind, u32 sheet offset`.
+`kind` 4 = date, 10 = digit, 1 = colon. Sheet = packed RGB565 cells of `w*h`,
+colour baked in, black background. Verified arithmetic:
+`10*60*90*2 = 108000` digits, `4*60*30*2 = 14400` date, `1*24*90*2 = 4320` colon.
+
+BLE:
+
+- custom service `16186Fxx-0000-1000-8000-00807F9B34FB`, data handle `0x2A`,
+  command handles `0x21`/`0x24`, CCCDs `0x22 0x25 0x28 0x2B 0x2E`.
+- MTU 247, writes 177 bytes, up to 22 chunks per window.
+- window = 6-byte marker `00 00 00 00 <count u16le>`, chunks of
+  `<seq u16le> <data>`; chunk 1 also carries `0E 00 <winIdx u16le> <12-byte field>`
+  plus a 10-byte meta in window 1.
+- flow control per window: marker → `000001010000`, last chunk → `000001000000`.
+- required pre-session: `53 3A` face-transfer command with face id `916`; without
+  it every write is answered `000001020000`.
+
+## Status (be precise)
+
+- Verified on hardware: transport, container rebuild, blob layout per region,
+  photo face with correct colours and a live clock, full-bleed geometry.
+- Open: black cell backgrounds around time/date/AM-PM over a photo. The glyph
+  sheets store black backgrounds; whether the firmware draws them or fills a
+  config rectangle is being tested with `PLATE PROBE`.
+- Open: widget record fields beyond x/y/w/h/kind/sheet; adding steps/day/battery
+  widgets needs the vendor schema in `assets/dial/style/OSW-802N/template*.json`
+  mapped to binary.
+- Untested: other NoiseFit models, blobs larger than the reference layouts.
+
+Do not claim the black boxes are fixed. Do not claim another model works.
+
+## Build and run
+
+```bash
+cd android
+gradle assembleDebug --no-daemon
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+```
+
+JDK 17, SDK 34, Gradle 8.7+. No wrapper checked in. `setup.md` has Windows and
+Unix variants.
+
+Flow: connect by MAC → pick photo → crop (drag/pinch) → build → upload. Keep the
+official app force-stopped: only one app can hold the BLE link.
+
+## Pitfalls
+
+- Wrong byte order looks like a channel swap; the blob is big endian.
+- The preview region only affects the face-list thumbnail, never the watch.
+- Replacing the sprite sheets breaks the clock; keeping them stock keeps it live.
+- Do not accept a header match as proof of correct rendering.
+- Scrub MAC addresses and tokens from published captures.
+- A bad face can leave the watch showing garbage; recovery is a re-sync or reset.
+
+## Scope
+
+Interoperability with hardware the user owns and artwork they may use. Not
+affiliated with Noise. Do not help extract paid vendor assets for redistribution or
+target devices the user does not own.
